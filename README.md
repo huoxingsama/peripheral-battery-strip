@@ -1,6 +1,6 @@
 # 外设电量条
 
-在 Windows 11 任务栏右下角查看无线耳机、鼠标、键盘和手柄的电量。电量条显示在 **隐藏图标箭头 `^` → 设备图标与百分比 → 输入法指示** 之间，鼠标悬停可查看设备名称。
+在 Windows 11 任务栏右下角查看无线耳机、鼠标、键盘和手柄的电量。安装程序会尝试把电量条放到**隐藏图标箭头 `^` 紧后方**，其他固定托盘图标和输入法保留各自的顺序。数字使用与 Windows 时钟接近的 Segoe UI 常规字重，并跟随任务栏的主题和缩放。将鼠标悬停在**设备图标**上可查看名称和电量。
 
 程序后台刷新电量。连接新设备后，只要电量读取组件支持该设备及其连接方式，它就会自动出现。任务栏最多显示五台设备，本地 JSON 接口可以读取所有已识别的设备。
 
@@ -8,8 +8,8 @@
 
 需要 **Windows 11 x64**、.NET Framework 4.8 或更新版本。安装在当前 Windows 账户下，无需管理员权限。首次安装需要联网获取电量读取组件。
 
-1. 从发布页下载 `PeripheralBatteryStrip-v1.0.0-win-x64.zip` 并解压。 [GitHub 发布页](https://github.com/huoxingsama/peripheral-battery-strip/releases)
-2. 双击 `安装.cmd`。安装期间会打开 Windows 的任务栏设置，将电量条使用的图标槽设为可见。
+1. 从发布页下载最新的 `PeripheralBatteryStrip-*-win-x64.zip` 并解压。 [GitHub 发布页](https://github.com/huoxingsama/peripheral-battery-strip/releases/latest)
+2. 双击 `安装.cmd`。安装期间可能打开 Windows 的任务栏设置。让安装程序完成可见性与位置检查即可。
 3. 安装完成后，程序从 `%LOCALAPPDATA%\PeripheralBatteryStrip` 启动。将鼠标移到电量条上，右键可以立即刷新、切换「登录 Windows 时启动」或退出。
 
 开机启动默认关闭。也可以在解压后的目录中运行以下命令，并在安装时启用登录启动。
@@ -19,6 +19,8 @@
 ```
 
 要卸载，运行发布包中的 `卸载.cmd`。
+
+Windows 负责显示折叠箭头。如果系统没有显示箭头，安装程序会尝试把电量条放在可见应用图标的最前面。若自动排列未完成，可运行 `.\安装.cmd -ManualPromotion`，按提示将临时的 1 到 10 号图标拖成一组。托盘槽位分散时，程序会在可见的自有槽位显示简化读数，避免遮住其他图标。 [Windows 任务栏排列说明](https://support.microsoft.com/zh-cn/windows/experience/personalization/customize-the-taskbar-in-windows)
 
 ## 设备兼容性
 

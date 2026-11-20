@@ -122,8 +122,10 @@ try {
     $installedStrip = Join-Path $installPath 'BatteryHubStrip.exe'
     $uninstaller = Join-Path $PSScriptRoot 'uninstall.ps1'
     $promoter = Join-Path $PSScriptRoot 'promote-slots.ps1'
+    $positioner = Join-Path $PSScriptRoot 'position-slots.ps1'
     if (!(Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw '安装包缺少 uninstall.ps1。' }
     if (!$StageOnly -and !(Test-Path -LiteralPath $promoter -PathType Leaf)) { throw '安装包缺少 promote-slots.ps1。' }
+    if (!$StageOnly -and !(Test-Path -LiteralPath $positioner -PathType Leaf)) { throw '安装包缺少 position-slots.ps1。' }
 
     $scratch = Join-Path ([IO.Path]::GetTempPath()) ('PeripheralBatteryStrip-' + [Guid]::NewGuid().ToString('N'))
     $stage = Join-Path $scratch 'stage'
@@ -173,15 +175,25 @@ try {
         exit 0
     }
 
-    $prepareProcess = Start-Process -FilePath $installedStrip -ArgumentList '--prepare' -PassThru
+    $prepareArgument = if ($ManualPromotion) { '--prepare-manual' } else { '--prepare' }
+    $prepareProcess = Start-Process -FilePath $installedStrip -ArgumentList $prepareArgument -PassThru
     try {
         if ($prepareProcess.WaitForExit(500)) { throw '启动托盘位置准备程序失败。' }
         if ($ManualPromotion) {
             Start-Process 'ms-settings:taskbar'
-            Write-Host '在 Windows 设置中展开「其他系统托盘图标」，打开「外设电量位置 1」到「外设电量位置 10」。'
+            Write-Host '在 Windows 设置中展开「其他系统托盘图标」，打开「外设电量槽位 1」到「外设电量槽位 10」。'
+            Write-Host '将任务栏上临时出现的 1 到 10 号图标拖成一组，并放在折叠箭头后面。'
             [void] (Read-Host '开启后按回车继续')
         }
         & $promoter -ExecutablePath $installedStrip -VerifyOnly:$ManualPromotion | Out-Null
+        Write-Host '正在核对电量栏的位置…'
+        $position = & $positioner -ProcessId $prepareProcess.Id -VerifyOnly
+        if ($position.Status -ne 'Positioned') {
+            Write-Warning $position.Message
+            Write-Host '可稍后运行「.\安装.cmd -ManualPromotion」重新排好位置。'
+        } else {
+            Write-Host $position.Message
+        }
     } catch {
         Write-Host '托盘位置尚未设好。可在终端运行「.\安装.cmd -ManualPromotion」按提示手动设置。'
         throw

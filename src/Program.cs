@@ -20,12 +20,13 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("外设电量条")]
 [assembly: AssemblyDescription("在 Windows 任务栏上显示外接设备的电量")]
 [assembly: AssemblyProduct("外设电量条")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 internal static class Program
 {
     private const string HostName = "Peripheral Battery Strip Background";
+    private const string Version = "1.0.1";
     internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     internal const string RunValue = "PeripheralBatteryStrip";
     internal const int RefreshMessage = 0x8101;
@@ -52,11 +53,11 @@ internal static class Program
                 Signal(0x0010);
                 return 0;
             case "--version":
-                WriteLine("1.0.0");
+                WriteLine(Version);
                 return 0;
             case "--help":
             case "-h":
-                WriteLine("外设电量条 1.0.0\n"
+                WriteLine("外设电量条 " + Version + "\n"
                     + "  无参数       打开任务栏电量条\n"
                     + "  --json       扫描设备并输出 UTF-8 JSON\n"
                     + "  --refresh    请求运行中的电量条立即刷新\n"
@@ -65,6 +66,7 @@ internal static class Program
                 return 0;
             case "":
             case "--prepare":
+            case "--prepare-manual":
                 break;
             default:
                 WriteLine("未知参数。使用 --help 查看用法。", true);
@@ -75,7 +77,7 @@ internal static class Program
         using (var mutex = new Mutex(true, @"Local\PeripheralBatteryStrip", out own))
         {
             if (!own) return 0;
-            bool preparation = mode == "--prepare";
+            bool preparation = mode == "--prepare" || mode == "--prepare-manual";
             if (!preparation && !ProviderInstalled())
             {
                 MessageBox.Show("找不到电量读取组件。请在安装包中运行「安装.cmd」。",
@@ -84,7 +86,7 @@ internal static class Program
             }
             Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
             Application.EnableVisualStyles();
-            using (var context = new BatteryStrip(preparation, HostName))
+            using (var context = new BatteryStrip(preparation, mode == "--prepare-manual", HostName))
                 Application.Run(context);
             return 0;
         }
@@ -156,11 +158,12 @@ internal static class Program
 internal sealed class BatteryStrip : ApplicationContext
 {
     private const int MaxSlots = 10;
-    private const uint SlotBase = 0x4700;
+    private const uint SlotBase = 0x4800;
     private const uint TrayMessage = 0x8100;
     private readonly bool preparation;
     private readonly HostWindow host;
     private readonly Icon blank;
+    private readonly Icon[] setupMarkers;
     private readonly ContextMenuStrip menu = new ContextMenuStrip();
     private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 850 };
     private readonly Dictionary<string, KeyValuePair<DateTime, Device>> lastReadings =
@@ -174,13 +177,17 @@ internal sealed class BatteryStrip : ApplicationContext
     private int activeSlots;
     private StripLayer layer;
     private Rectangle lastBounds;
-    private bool lightTheme;
+    private Color lastForeground;
+    private bool lastHighContrast;
+    private int lastDpi;
+    private bool compactFallback;
     private int[] previousSlotOrder = new int[0];
 
-    internal BatteryStrip(bool preparation, string hostName)
+    internal BatteryStrip(bool preparation, bool showSetupMarkers, string hostName)
     {
         this.preparation = preparation;
-        blank = EmptyIcon();
+        blank = MakeSlotIcon(0);
+        setupMarkers = showSetupMarkers ? Enumerable.Range(1, MaxSlots).Select(MakeSlotIcon).ToArray() : new Icon[0];
         host = new HostWindow(this, hostName);
         menu.Items.Add("立即刷新", null, delegate { nextQuery = DateTime.MinValue; Tick(); });
         menu.Items.Add("登录 Windows 时启动", null, delegate { ToggleStartup(); });
@@ -268,7 +275,8 @@ internal sealed class BatteryStrip : ApplicationContext
         }
         while (activeSlots < desired)
         {
-            if (!SendSlot(0, activeSlots, blank, SlotName(activeSlots))) break;
+            Icon icon = setupMarkers.Length > 0 ? setupMarkers[activeSlots] : blank;
+            if (!SendSlot(0, activeSlots, icon, SlotName(activeSlots))) break;
             SendSlot(4, activeSlots, null);
             activeSlots++;
             redraw = true;
@@ -284,24 +292,25 @@ internal sealed class BatteryStrip : ApplicationContext
         entry.Version = 4;
         if (action == 0 || action == 1)
         {
-            entry.Flags = 0x01 | 0x02 | 0x04 | 0x80;
+            entry.Flags = 0x01 | 0x02 | 0x04;
+            if (!string.IsNullOrEmpty(tooltip)) entry.Flags |= 0x80;
             entry.Callback = TrayMessage;
             entry.Icon = icon.Handle;
-            entry.Tooltip = tooltip;
+            entry.Tooltip = tooltip ?? "";
         }
         return Native.Shell_NotifyIcon(action, ref entry);
     }
 
     private static string SlotName(int index)
     {
-        return "外设电量位置 " + (index + 1).ToString(CultureInfo.InvariantCulture);
+        return "外设电量槽位 " + (index + 1).ToString(CultureInfo.InvariantCulture);
     }
 
-    private static string SlotTooltip(Device device, int index)
+    internal static string SlotTooltip(Device device)
     {
-        if (device == null) return SlotName(index) + "\n外设电量";
+        if (device == null) return "外设电量";
         string level = device.Level == "×" ? "未连接" : device.Level == "?" ? "电量未知" : device.Level;
-        string label = SlotName(index) + "\n" + device.Name + " " + level;
+        string label = device.Name + "\n" + level;
         return label.Length > 127 ? label.Substring(0, 127) : label;
     }
 
@@ -309,47 +318,83 @@ internal sealed class BatteryStrip : ApplicationContext
     {
         IntPtr bar = Native.FindWindow("Shell_TrayWnd", null);
         Native.Rect root;
-        Rectangle bounds = Rectangle.Empty;
-        int[] slotOrder = new int[0];
-        bool ready = bar != IntPtr.Zero && Native.IsWindowVisible(bar) &&
-            Native.GetWindowRect(bar, out root) && !HasFullscreenForeground(bar) &&
-            TryVisibleBounds(root.Rectangle, out bounds, out slotOrder);
-        if (!ready)
+        if (bar == IntPtr.Zero || !Native.IsWindowVisible(bar) ||
+            !Native.GetWindowRect(bar, out root) || HasFullscreenForeground(bar))
         {
-            if (layer != null) Native.ShowWindow(layer.Handle, 0);
-            lastBounds = Rectangle.Empty;
+            HideLayer();
             return;
         }
 
+        int dpi = (int)Native.GetDpiForWindow(bar);
+        if (dpi <= 0) dpi = 96;
+        bool highContrast = SystemInformation.HighContrast;
+        Color foreground = ClockStyle.Foreground(highContrast);
+        bool styleChanged = dpi != lastDpi || foreground != lastForeground || highContrast != lastHighContrast;
+        lastDpi = dpi;
+        lastForeground = foreground;
+        lastHighContrast = highContrast;
+
+        Rectangle bounds;
+        int[] slotOrder;
+        if (!TryVisibleBounds(root.Rectangle, out bounds, out slotOrder))
+        {
+            HideLayer();
+            if (!compactFallback || redraw || styleChanged)
+                ShowCompactIcons(foreground);
+            compactFallback = true;
+            redraw = false;
+            return;
+        }
+
+        if (compactFallback)
+        {
+            compactFallback = false;
+            redraw = true;
+        }
         if (layer == null)
         {
-            layer = new StripLayer();
+            layer = new StripLayer(delegate { menu.Show(Cursor.Position); });
             redraw = true;
         }
 
-        int dpi = (int)Native.GetDpiForWindow(bar);
-        bool light = Convert.ToInt32(Registry.GetValue(
-            @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-            "SystemUsesLightTheme", 0), CultureInfo.InvariantCulture) != 0;
-        if (redraw || light != lightTheme || bounds.Size != lastBounds.Size)
+        if (redraw || styleChanged || bounds.Size != lastBounds.Size)
         {
-            layer.Paint(bounds.Size, dpi > 0 ? dpi : 96, devices, loaded, light);
-            lightTheme = light;
+            layer.Paint(bounds.Size, dpi, devices, loaded, foreground, highContrast);
         }
         if (redraw || !previousSlotOrder.SequenceEqual(slotOrder))
         {
-            for (int offset = 0; offset < slotOrder.Length; offset++)
-            {
-                int slot = slotOrder[offset];
-                Device device = devices.Length > 0 ? devices[offset * devices.Length / slotOrder.Length] : null;
-                SendSlot(1, slot, blank, SlotTooltip(device, slot));
-            }
+            foreach (int slot in slotOrder) SendSlot(1, slot, blank);
             previousSlotOrder = slotOrder;
         }
         Native.SetWindowPos(layer.Handle, new IntPtr(-1), bounds.Left, bounds.Top,
             bounds.Width, bounds.Height, 0x0010 | 0x0040);
         lastBounds = bounds;
         redraw = false;
+    }
+
+    private void HideLayer()
+    {
+        if (layer != null) layer.Hide();
+        lastBounds = Rectangle.Empty;
+    }
+
+    private void ShowCompactIcons(Color foreground)
+    {
+        for (int slot = 0; slot < activeSlots; slot++)
+        {
+            int deviceIndex = slot / 2;
+            Device device = deviceIndex < devices.Length ? devices[deviceIndex] : null;
+            if (slot % 2 != 0)
+            {
+                SendSlot(1, slot, blank);
+                continue;
+            }
+            string label = device == null ? "—" : device.Level.TrimEnd('%');
+            Color color = device != null && device.Dimmed
+                ? Color.FromArgb(foreground.A * 55 / 100, foreground) : foreground;
+            using (Icon icon = MakeSlotIcon(label, color))
+                SendSlot(1, slot, icon, SlotTooltip(device));
+        }
     }
 
     private static bool HasFullscreenForeground(IntPtr bar)
@@ -436,10 +481,28 @@ internal sealed class BatteryStrip : ApplicationContext
         catch (AggregateException) { return null; }
     }
 
-    private static Icon EmptyIcon()
+    private static Icon MakeSlotIcon(int number)
+    {
+        string label = number > 0 ? number.ToString(CultureInfo.InvariantCulture) : "";
+        return MakeSlotIcon(label, ClockStyle.Foreground(SystemInformation.HighContrast));
+    }
+
+    private static Icon MakeSlotIcon(string label, Color color)
     {
         using (var image = new Bitmap(32, 32, PixelFormat.Format32bppArgb))
         {
+            if (label.Length > 0)
+            {
+                using (Graphics graphics = Graphics.FromImage(image))
+                using (var font = new Font("Segoe UI", label.Length > 2 ? 15 : 19, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var foreground = new SolidBrush(color))
+                using (var alignment = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                    graphics.DrawString(label, font, foreground,
+                        new RectangleF(0, 0, 32, 32), alignment);
+                }
+            }
             IntPtr raw = image.GetHicon();
             using (var borrowed = Icon.FromHandle(raw))
             {
@@ -469,11 +532,12 @@ internal sealed class BatteryStrip : ApplicationContext
     {
         timer.Stop();
         ReconcileSlots(0);
-        if (layer != null) layer.DestroyHandle();
+        if (layer != null) layer.Dispose();
         host.DestroyHandle();
         menu.Dispose();
         timer.Dispose();
         blank.Dispose();
+        foreach (Icon icon in setupMarkers) icon.Dispose();
         base.ExitThreadCore();
     }
 
@@ -591,36 +655,112 @@ internal sealed class Device : IEquatable<Device>
     }
 }
 
-internal sealed class StripLayer : NativeWindow
+internal static class ClockStyle
 {
-    internal StripLayer()
+    internal static Color Foreground(bool highContrast)
     {
+        if (highContrast) return SystemColors.WindowText;
+        bool light = Convert.ToInt32(Registry.GetValue(
+            @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "SystemUsesLightTheme", 0), CultureInfo.InvariantCulture) != 0;
+        return light ? Color.FromArgb(228, 0, 0, 0) : Color.White;
+    }
+}
+
+internal sealed class StripLayer : NativeWindow, IDisposable
+{
+    private readonly GlyphHover hover;
+    private readonly Action showMenu;
+    private readonly List<KeyValuePair<RectangleF, string>> hoverTargets = new List<KeyValuePair<RectangleF, string>>();
+
+    internal StripLayer(Action showMenu)
+    {
+        this.showMenu = showMenu;
         CreateHandle(new CreateParams
         {
             Caption = "Peripheral Battery Strip Layer",
             Style = unchecked((int)0x80000000),
-            ExStyle = 0x80000 | 0x08000000 | 0x0020 | 0x0080,
+            ExStyle = 0x80000 | 0x08000000 | 0x0080,
             Width = 1,
             Height = 1
         });
+        hover = new GlyphHover(Handle);
     }
 
-    internal void Paint(Size size, int dpi, Device[] devices, bool loaded, bool light)
+    internal void Hide()
     {
+        hover.Clear();
+        Native.ShowWindow(Handle, 0);
+    }
+
+    protected override void WndProc(ref Message message)
+    {
+        switch (message.Msg)
+        {
+            case 0x0021: // WM_MOUSEACTIVATE
+                message.Result = new IntPtr(3);
+                return;
+            case 0x0200: // WM_MOUSEMOVE
+                UpdateHover(message.LParam);
+                return;
+            case 0x02A3: // WM_MOUSELEAVE
+                if (hover != null) hover.Clear();
+                return;
+            case 0x0205: // WM_RBUTTONUP
+                if (hover != null) hover.Clear();
+                showMenu();
+                return;
+        }
+        base.WndProc(ref message);
+    }
+
+    private void UpdateHover(IntPtr data)
+    {
+        if (hover == null) return;
+        long coords = data.ToInt64();
+        int x = unchecked((short)(coords & 0xffff));
+        int y = unchecked((short)((coords >> 16) & 0xffff));
+        hover.TrackLeave();
+        Native.Rect bounds;
+        if (Native.GetWindowRect(Handle, out bounds))
+        {
+            foreach (var target in hoverTargets)
+            {
+                if (target.Key.Contains(x, y))
+                {
+                    int center = (int)(target.Key.Left + target.Key.Width / 2);
+                    hover.Move(target.Value, new Point(bounds.Left + center, bounds.Top - 3));
+                    return;
+                }
+            }
+        }
+        hover.Clear();
+    }
+
+    public void Dispose()
+    {
+        hover.Dispose();
+        DestroyHandle();
+    }
+
+    internal void Paint(Size size, int dpi, Device[] devices, bool loaded, Color foreground, bool highContrast)
+    {
+        hoverTargets.Clear();
         using (var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb))
         {
             using (Graphics g = Graphics.FromImage(bitmap))
             using (var glyphFont = new Font("Segoe Fluent Icons", 16f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
-            using (var textFont = new Font("Segoe UI Variable Text", 13f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
-            using (var compactFont = new Font("Segoe UI Variable Text", 11f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var textFont = new Font("Segoe UI", 12f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var compactFont = new Font("Segoe UI", 11f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
             using (var format = new StringFormat(StringFormat.GenericTypographic) { LineAlignment = StringAlignment.Center })
             {
+                // A nearly transparent base keeps the whole device group above its two native slots.
+                g.Clear(Color.FromArgb(1, 0, 0, 0));
                 g.CompositingMode = CompositingMode.SourceOver;
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                Color foreground = light ? Color.Black : Color.White;
                 if (devices.Length == 0)
                 {
-                    using (var brush = new SolidBrush(Color.FromArgb(190, foreground)))
+                    using (var brush = new SolidBrush(Color.FromArgb(foreground.A * 3 / 4, foreground)))
                     {
                         format.Alignment = StringAlignment.Center;
                         g.DrawString(loaded ? "—" : "…", textFont, brush, new RectangleF(0, 0, size.Width, size.Height), format);
@@ -630,16 +770,19 @@ internal sealed class StripLayer : NativeWindow
                 {
                     float cell = (float)size.Width / devices.Length;
                     for (int index = 0; index < devices.Length; index++)
-                        DrawDevice(g, new RectangleF(index * cell, 0, cell, size.Height), devices[index],
-                            glyphFont, textFont, compactFont, format, foreground, dpi);
+                    {
+                        RectangleF glyph = DrawDevice(g, new RectangleF(index * cell, 0, cell, size.Height), devices[index],
+                            glyphFont, textFont, compactFont, format, foreground, highContrast, dpi);
+                        hoverTargets.Add(new KeyValuePair<RectangleF, string>(glyph, BatteryStrip.SlotTooltip(devices[index])));
+                    }
                 }
             }
             Present(bitmap);
         }
     }
 
-    private static void DrawDevice(Graphics g, RectangleF cell, Device device, Font glyphFont, Font textFont,
-        Font compactFont, StringFormat format, Color foreground, int dpi)
+    private static RectangleF DrawDevice(Graphics g, RectangleF cell, Device device, Font glyphFont, Font textFont,
+        Font compactFont, StringFormat format, Color foreground, bool highContrast, int dpi)
     {
         string glyph;
         switch (device.Kind)
@@ -652,7 +795,7 @@ internal sealed class StripLayer : NativeWindow
             case "microphone": glyph = "\uE720"; break;
             default: glyph = "\uE772"; break;
         }
-        float gap = 5f * dpi / 96f;
+        float gap = 4f * dpi / 96f;
         float glyphWidth = g.MeasureString(glyph, glyphFont, 100, format).Width;
         float textWidth = g.MeasureString(device.Level, textFont, 100, format).Width;
         float chargingWidth = device.Charging ? 10f * dpi / 96f : 0;
@@ -665,23 +808,28 @@ internal sealed class StripLayer : NativeWindow
         }
         float total = glyphWidth + gap + textWidth + chargingWidth;
         float x = cell.Left + Math.Max(1, (cell.Width - total) / 2f);
-        int alpha = device.Dimmed ? 140 : 255;
+        Color valueColor = Color.FromArgb(device.Dimmed ? foreground.A * 55 / 100 : foreground.A, foreground);
+        bool low = device.Percent >= 0 && device.Percent <= 15 && !device.Charging && !device.Dimmed;
+        Color iconColor = low && !highContrast
+            ? (foreground.R < 128 ? Color.FromArgb(172, 30, 45) : Color.FromArgb(255, 111, 120))
+            : valueColor;
         var clip = g.Save();
         g.SetClip(cell);
-        using (var symbol = new SolidBrush(Color.FromArgb(alpha, foreground)))
-        using (var value = new SolidBrush(Color.FromArgb(alpha,
-            device.Percent >= 0 && device.Percent <= 15 && !device.Charging ? Color.FromArgb(242, 65, 77) : foreground)))
+        using (var symbol = new SolidBrush(iconColor))
+        using (var value = new SolidBrush(valueColor))
         {
             g.DrawString(glyph, glyphFont, symbol, new RectangleF(x, 0, glyphWidth + 2, cell.Height), format);
             g.DrawString(device.Level, chosen, value, new RectangleF(x + glyphWidth + gap, 0, textWidth + 2, cell.Height), format);
         }
         if (device.Charging)
         {
-            using (var bolt = new SolidBrush(device.Percent == 100 ? Color.MediumSeaGreen : Color.DeepSkyBlue))
+            using (var bolt = new SolidBrush(highContrast ? foreground :
+                device.Percent == 100 ? Color.MediumSeaGreen : Color.DeepSkyBlue))
                 g.DrawString(device.Percent == 100 ? "\u2713" : "\u26A1", compactFont, bolt,
                     new RectangleF(x + glyphWidth + gap + textWidth, 0, chargingWidth + 2, cell.Height), format);
         }
         g.Restore(clip);
+        return new RectangleF(x - 1, (cell.Height - glyphFont.Size) / 2f - 1, glyphWidth + 2, glyphFont.Size + 2);
     }
 
     private void Present(Bitmap bitmap)

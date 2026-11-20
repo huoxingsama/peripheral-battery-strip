@@ -16,7 +16,7 @@ function Get-SlotRegistrations {
     if (!(Test-Path -LiteralPath $registrations)) { return }
     Get-ChildItem -LiteralPath $registrations | ForEach-Object {
         $icon = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
-        if ($icon.ExecutablePath -ieq $exe -and $icon.InitialTooltip -cmatch '^外设电量位置 (10|[1-9])$') {
+        if ($icon.ExecutablePath -ieq $exe -and $icon.InitialTooltip -cmatch '^外设电量槽位 (10|[1-9])$') {
             [pscustomobject] @{ Number = [int] $Matches[1]; Id = $_.PSChildName; Promoted = ($icon.IsPromoted -eq 1) }
         }
     }
@@ -24,17 +24,82 @@ function Get-SlotRegistrations {
 
 function Get-SettingsSection {
     $element = [System.Windows.Automation.AutomationElement]
+    $descendants = [System.Windows.Automation.TreeScope]::Descendants
+    $sectionClass = 'NamedContainerAutomationPeer'
+    $group = [System.Windows.Automation.PropertyCondition]::new($element::ClassNameProperty, $sectionClass)
     $condition = [System.Windows.Automation.AndCondition]::new(
-        [System.Windows.Automation.PropertyCondition]::new($element::ClassNameProperty, 'NamedContainerAutomationPeer'),
+        $group,
         [System.Windows.Automation.OrCondition]::new(
             [System.Windows.Automation.PropertyCondition]::new($element::NameProperty, '其他系统托盘图标'),
             [System.Windows.Automation.PropertyCondition]::new($element::NameProperty, 'Other system tray icons')))
+    $firstAppToggle = 'SystemSettings_DesktopTaskbar_SystemTrayAppListItem{0}_ToggleSwitch' -f $slots[0].Id
+    $landmark = [System.Windows.Automation.OrCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new($element::AutomationIdProperty, 'SystemSettings_SysTray_Chevron_Toggle_ToggleSwitch'),
+        [System.Windows.Automation.PropertyCondition]::new($element::AutomationIdProperty, $firstAppToggle))
 
-    foreach ($process in Get-Process ApplicationFrameHost, SystemSettings -ErrorAction SilentlyContinue) {
+    $settings = @(Get-Process SystemSettings -ErrorAction SilentlyContinue)
+    $frames = @(Get-Process ApplicationFrameHost -ErrorAction SilentlyContinue)
+    foreach ($process in ($settings + $frames)) {
         if ($process.MainWindowHandle -eq [IntPtr]::Zero) { continue }
         $window = $element::FromHandle($process.MainWindowHandle)
-        $section = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $section = $window.FindFirst($descendants, $condition)
         if ($null -ne $section) { return $section }
+
+        if ($process.ProcessName -eq 'ApplicationFrameHost') {
+            # A frame may host another app; scope probing to Settings content inside it.
+            $content = $null
+            foreach ($settingsProcess in $settings) {
+                $owner = [System.Windows.Automation.PropertyCondition]::new($element::ProcessIdProperty, $settingsProcess.Id)
+                $content = $window.FindFirst($descendants, $owner)
+                if ($null -ne $content) { break }
+            }
+            if ($null -eq $content) { continue }
+            $window = $content
+        }
+
+        $target = $window.FindFirst($descendants, $landmark)
+        if ($null -ne $target) {
+            $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+            for ($ancestor = $walker.GetParent($target); $null -ne $ancestor; $ancestor = $walker.GetParent($ancestor)) {
+                if ($ancestor.Current.ClassName -eq $sectionClass -and (Find-ElementById $ancestor 'EntityItemButton')) {
+                    return $ancestor
+                }
+                if ($ancestor.Equals($window)) { break }
+            }
+        }
+
+        # The stable tray controls can be absent from the UIA tree until their group opens.
+        $candidates = $window.FindAll($descendants, $group)
+        for ($index = 0; $index -lt [Math]::Min(16, $candidates.Count); $index++) {
+            $candidate = $candidates.get_Item($index)
+            $header = Find-ElementById $candidate 'EntityItemButton'
+            $expand = $null
+            if ($null -eq $header -or !$header.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref] $expand)) {
+                continue
+            }
+            if ($expand.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) { continue }
+
+            $matched = $false
+            try {
+                $expand.Expand()
+                for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                    if ($null -ne $candidate.FindFirst($descendants, $landmark)) {
+                        $matched = $true
+                        return $candidate
+                    }
+                    if ($attempt -lt 2) { Start-Sleep -Milliseconds 100 }
+                }
+            } finally {
+                if (!$matched) {
+                    try {
+                        if ($expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded) {
+                            $expand.Collapse()
+                        }
+                    }
+                    catch [System.Windows.Automation.ElementNotAvailableException] { }
+                }
+            }
+        }
     }
 }
 
