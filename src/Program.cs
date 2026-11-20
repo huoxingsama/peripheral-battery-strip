@@ -20,13 +20,13 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("外设电量条")]
 [assembly: AssemblyDescription("在 Windows 任务栏上显示外接设备的电量")]
 [assembly: AssemblyProduct("外设电量条")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 internal static class Program
 {
     private const string HostName = "Peripheral Battery Strip Background";
-    private const string Version = "1.0.1";
+    private const string Version = "1.0.2";
     internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     internal const string RunValue = "PeripheralBatteryStrip";
     internal const int RefreshMessage = 0x8101;
@@ -697,6 +697,14 @@ internal sealed class StripLayer : NativeWindow, IDisposable
     {
         switch (message.Msg)
         {
+            case 0x0020: // WM_SETCURSOR
+                if ((message.LParam.ToInt64() & 0xffff) == 1) // HTCLIENT
+                {
+                    Native.SetCursor(Cursors.Arrow.Handle);
+                    message.Result = new IntPtr(1);
+                    return;
+                }
+                break;
             case 0x0021: // WM_MOUSEACTIVATE
                 message.Result = new IntPtr(3);
                 return;
@@ -750,8 +758,9 @@ internal sealed class StripLayer : NativeWindow, IDisposable
         {
             using (Graphics g = Graphics.FromImage(bitmap))
             using (var glyphFont = new Font("Segoe Fluent Icons", 16f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
-            using (var textFont = new Font("Segoe UI", 12f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
-            using (var compactFont = new Font("Segoe UI", 11f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
+            // Semibold matches the clock's visible stroke coverage on the transparent strip.
+            using (var textFont = new Font("Segoe UI Semibold", 12f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var compactFont = new Font("Segoe UI Semibold", 11f * dpi / 96f, FontStyle.Regular, GraphicsUnit.Pixel))
             using (var format = new StringFormat(StringFormat.GenericTypographic) { LineAlignment = StringAlignment.Center })
             {
                 // A nearly transparent base keeps the whole device group above its two native slots.
@@ -876,6 +885,8 @@ internal sealed class StripLayer : NativeWindow, IDisposable
 
 internal static class Native
 {
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SetCursor(IntPtr cursor);
     [DllImport("kernel32.dll")]
     internal static extern IntPtr GetStdHandle(int handle);
     [DllImport("kernel32.dll")]
