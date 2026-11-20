@@ -20,13 +20,13 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("外设电量条")]
 [assembly: AssemblyDescription("在 Windows 任务栏上显示外接设备的电量")]
 [assembly: AssemblyProduct("外设电量条")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
 
 internal static class Program
 {
     private const string HostName = "Peripheral Battery Strip Background";
-    private const string Version = "1.0.2";
+    private const string Version = "1.0.3";
     internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     internal const string RunValue = "PeripheralBatteryStrip";
     internal const int RefreshMessage = 0x8101;
@@ -164,7 +164,6 @@ internal sealed class BatteryStrip : ApplicationContext
     private readonly HostWindow host;
     private readonly Icon blank;
     private readonly Icon[] setupMarkers;
-    private readonly ContextMenuStrip menu = new ContextMenuStrip();
     private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 850 };
     private readonly Dictionary<string, KeyValuePair<DateTime, Device>> lastReadings =
         new Dictionary<string, KeyValuePair<DateTime, Device>>(StringComparer.OrdinalIgnoreCase);
@@ -172,7 +171,6 @@ internal sealed class BatteryStrip : ApplicationContext
     private Task<Device[]> query;
     private DateTime nextQuery;
     private DateTime lastSuccess;
-    private bool loaded;
     private bool redraw = true;
     private int activeSlots;
     private StripLayer layer;
@@ -181,6 +179,7 @@ internal sealed class BatteryStrip : ApplicationContext
     private bool lastHighContrast;
     private int lastDpi;
     private bool compactFallback;
+    private bool menuOpen;
     private int[] previousSlotOrder = new int[0];
 
     internal BatteryStrip(bool preparation, bool showSetupMarkers, string hostName)
@@ -189,13 +188,6 @@ internal sealed class BatteryStrip : ApplicationContext
         blank = MakeSlotIcon(0);
         setupMarkers = showSetupMarkers ? Enumerable.Range(1, MaxSlots).Select(MakeSlotIcon).ToArray() : new Icon[0];
         host = new HostWindow(this, hostName);
-        menu.Items.Add("立即刷新", null, delegate { nextQuery = DateTime.MinValue; Tick(); });
-        menu.Items.Add("登录 Windows 时启动", null, delegate { ToggleStartup(); });
-        menu.Items.Add("退出", null, delegate { ExitThread(); });
-        menu.Opening += delegate
-        {
-            ((ToolStripMenuItem)menu.Items[1]).Checked = StartupEnabled();
-        };
         timer.Tick += delegate { Tick(); };
         timer.Start();
         Tick();
@@ -216,24 +208,24 @@ internal sealed class BatteryStrip : ApplicationContext
             query = null;
             if (result != null)
             {
-                result = result.Take(MaxSlots / 2).ToArray();
+                foreach (Device disconnected in result.Where(device => !device.Connected))
+                    lastReadings.Remove(disconnected.Key);
+                result = result.Where(device => device.Connected).Take(MaxSlots / 2).ToArray();
                 for (int index = 0; index < result.Length; index++)
                     result[index] = ApplyLastReading(result[index], now);
                 foreach (string stale in lastReadings.Where(item => now - item.Value.Key > TimeSpan.FromMinutes(5))
                     .Select(item => item.Key).ToArray())
                     lastReadings.Remove(stale);
-                if (!loaded || !devices.SequenceEqual(result))
+                if (!devices.SequenceEqual(result))
                 {
                     devices = result;
                     redraw = true;
                 }
-                loaded = true;
                 lastSuccess = now;
             }
-            else if (loaded && now - lastSuccess > TimeSpan.FromMinutes(2))
+            else if (devices.Length > 0 && now - lastSuccess > TimeSpan.FromMinutes(2))
             {
                 devices = new Device[0];
-                loaded = false;
                 redraw = true;
             }
         }
@@ -243,9 +235,9 @@ internal sealed class BatteryStrip : ApplicationContext
             nextQuery = now.AddSeconds(30);
         }
 
-        int desired = Math.Min(MaxSlots, Math.Max(2, devices.Length * 2));
-        ReconcileSlots(desired);
-        PositionLayer();
+        ReconcileSlots(devices.Length * 2);
+        if (activeSlots == 0) HideLayer();
+        else PositionLayer();
     }
 
     private Device ApplyLastReading(Device current, DateTime now)
@@ -353,13 +345,13 @@ internal sealed class BatteryStrip : ApplicationContext
         }
         if (layer == null)
         {
-            layer = new StripLayer(delegate { menu.Show(Cursor.Position); });
+            layer = new StripLayer(ShowMenu);
             redraw = true;
         }
 
         if (redraw || styleChanged || bounds.Size != lastBounds.Size)
         {
-            layer.Paint(bounds.Size, dpi, devices, loaded, foreground, highContrast);
+            layer.Paint(bounds.Size, dpi, devices, foreground, highContrast);
         }
         if (redraw || !previousSlotOrder.SequenceEqual(slotOrder))
         {
@@ -382,15 +374,14 @@ internal sealed class BatteryStrip : ApplicationContext
     {
         for (int slot = 0; slot < activeSlots; slot++)
         {
-            int deviceIndex = slot / 2;
-            Device device = deviceIndex < devices.Length ? devices[deviceIndex] : null;
+            Device device = devices[slot / 2];
             if (slot % 2 != 0)
             {
                 SendSlot(1, slot, blank);
                 continue;
             }
-            string label = device == null ? "—" : device.Level.TrimEnd('%');
-            Color color = device != null && device.Dimmed
+            string label = device.Level.TrimEnd('%');
+            Color color = device.Dimmed
                 ? Color.FromArgb(foreground.A * 55 / 100, foreground) : foreground;
             using (Icon icon = MakeSlotIcon(label, color))
                 SendSlot(1, slot, icon, SlotTooltip(device));
@@ -528,13 +519,34 @@ internal sealed class BatteryStrip : ApplicationContext
         }
     }
 
+    private void ShowMenu(IntPtr owner)
+    {
+        if (preparation || menuOpen) return;
+        TrayCommand command;
+        menuOpen = true;
+        try { command = TrayMenu.Show(owner, StartupEnabled()); }
+        finally { menuOpen = false; }
+        switch (command)
+        {
+            case TrayCommand.Refresh:
+                nextQuery = DateTime.MinValue;
+                Tick();
+                break;
+            case TrayCommand.Autostart:
+                ToggleStartup();
+                break;
+            case TrayCommand.Exit:
+                ExitThread();
+                break;
+        }
+    }
+
     protected override void ExitThreadCore()
     {
         timer.Stop();
         ReconcileSlots(0);
         if (layer != null) layer.Dispose();
         host.DestroyHandle();
-        menu.Dispose();
         timer.Dispose();
         blank.Dispose();
         foreach (Icon icon in setupMarkers) icon.Dispose();
@@ -561,7 +573,7 @@ internal sealed class BatteryStrip : ApplicationContext
             }
             if (message.Msg == TrayMessage && ((int)message.LParam & 0xffff) == 0x007B)
             {
-                owner.menu.Show(Cursor.Position);
+                owner.ShowMenu(Handle);
                 return;
             }
             if (message.Msg == Program.RefreshMessage)
@@ -670,10 +682,10 @@ internal static class ClockStyle
 internal sealed class StripLayer : NativeWindow, IDisposable
 {
     private readonly GlyphHover hover;
-    private readonly Action showMenu;
+    private readonly Action<IntPtr> showMenu;
     private readonly List<KeyValuePair<RectangleF, string>> hoverTargets = new List<KeyValuePair<RectangleF, string>>();
 
-    internal StripLayer(Action showMenu)
+    internal StripLayer(Action<IntPtr> showMenu)
     {
         this.showMenu = showMenu;
         CreateHandle(new CreateParams
@@ -716,7 +728,7 @@ internal sealed class StripLayer : NativeWindow, IDisposable
                 return;
             case 0x0205: // WM_RBUTTONUP
                 if (hover != null) hover.Clear();
-                showMenu();
+                showMenu(Handle);
                 return;
         }
         base.WndProc(ref message);
@@ -751,7 +763,7 @@ internal sealed class StripLayer : NativeWindow, IDisposable
         DestroyHandle();
     }
 
-    internal void Paint(Size size, int dpi, Device[] devices, bool loaded, Color foreground, bool highContrast)
+    internal void Paint(Size size, int dpi, Device[] devices, Color foreground, bool highContrast)
     {
         hoverTargets.Clear();
         using (var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb))
@@ -767,23 +779,12 @@ internal sealed class StripLayer : NativeWindow, IDisposable
                 g.Clear(Color.FromArgb(1, 0, 0, 0));
                 g.CompositingMode = CompositingMode.SourceOver;
                 g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                if (devices.Length == 0)
+                float cell = (float)size.Width / devices.Length;
+                for (int index = 0; index < devices.Length; index++)
                 {
-                    using (var brush = new SolidBrush(Color.FromArgb(foreground.A * 3 / 4, foreground)))
-                    {
-                        format.Alignment = StringAlignment.Center;
-                        g.DrawString(loaded ? "—" : "…", textFont, brush, new RectangleF(0, 0, size.Width, size.Height), format);
-                    }
-                }
-                else
-                {
-                    float cell = (float)size.Width / devices.Length;
-                    for (int index = 0; index < devices.Length; index++)
-                    {
-                        RectangleF glyph = DrawDevice(g, new RectangleF(index * cell, 0, cell, size.Height), devices[index],
-                            glyphFont, textFont, compactFont, format, foreground, highContrast, dpi);
-                        hoverTargets.Add(new KeyValuePair<RectangleF, string>(glyph, BatteryStrip.SlotTooltip(devices[index])));
-                    }
+                    RectangleF glyph = DrawDevice(g, new RectangleF(index * cell, 0, cell, size.Height), devices[index],
+                        glyphFont, textFont, compactFont, format, foreground, highContrast, dpi);
+                    hoverTargets.Add(new KeyValuePair<RectangleF, string>(glyph, BatteryStrip.SlotTooltip(devices[index])));
                 }
             }
             Present(bitmap);
